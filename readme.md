@@ -12,8 +12,8 @@ The repository also contains example experiments, trained segmentation models, a
 
 This folder contains the material used to train and evaluate the bright-field segmentation model.
 
-- `pixel-classification.ipynb` contains the model-training workflow.
-- The `zyla/` and `prime_95b/` folders contain labelled training and test images from different camera setups, together with generated model files.
+- `pixel-classification.py` contains the model-training workflow.
+- The `zyla/` and `prime_95b/` folders contain labelled training and test images from different camera setups, together with generated model files. The `zyla` setup is used as an example.
 
 Model training is not normally required when analysing a new experiment. It is included mainly for scientific provenance and future model development.
 
