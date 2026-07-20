@@ -1,0 +1,51 @@
+# Provisional dependency list for this repository.
+#
+# Versions are intentionally left unpinned until the workflows have been
+# reproduced and tested in a clean environment. Most historical notebooks
+# record Python 3.9.15, while a few newer notebooks use later Python versions.
+
+# Core image processing and random-forest training
+apoc
+nd2
+numba
+numpy
+pandas
+pyclesperanto
+pyopencl
+scikit-image
+scipy
+
+# Downstream analysis, plotting, and notebooks
+bokeh
+bokeh-catplot
+ipykernel
+ipython
+iqplot
+jupyterlab
+matplotlib
+nest-asyncio
+openpyxl
+orjson
+pyboat
+PyWavelets
+scienceplots
+seaborn
+selenium
+statsmodels
+tornado
+tqdm
+
+# Legacy image-loading and GPU notebook support
+nd2reader
+pyclesperanto-prototype
+
+# Optional QC/preview utilities (uncomment if those workflows are needed)
+# torch
+# torchvision
+
+# The background-subtraction benchmark also imports CuPy. Install the CuPy
+# package matching the machine's CUDA version separately (for example,
+# cupy-cuda11x or cupy-cuda12x); the required CUDA version is not documented.
+
+# APOC, PyOpenCL, and pyclesperanto also require a working system OpenCL
+# runtime/driver, which cannot be installed through this requirements file.
