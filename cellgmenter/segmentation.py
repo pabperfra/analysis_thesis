@@ -1,4 +1,12 @@
-from skimage.measure import label, regionprops, block_reduce
+"""Segment, track, and measure cells in time-lapse microscopy images.
+
+The active pipeline expects image arrays ordered as ``(time, channel, y, x)``.
+Bright-field channel 0 drives segmentation, while channel 1 receives the
+fluorescence background correction. Scientific constants and operation order
+in this module are intentionally left unchanged during documentation cleanup.
+"""
+
+from skimage.measure import regionprops, block_reduce
 import numpy as np
 import pyclesperanto as cle
 import json
@@ -7,29 +15,39 @@ import os
 import math
 
 from numba import jit, prange, njit
-# from pathlib import Path
+
+
+# Background-normalization settings used by the active APOC pipeline.
 gpu = False
 sigma = 50
-minimum_size = 250
-# Functions
 
 
-# Tracking functions
+# Tracking helpers
 
 def read_previous_label_data(paths):
-    """Return a list of dicts loaded from *.json files of the previous frame."""
+    """Load previous-frame cell records in the supplied path order.
+
+    The caller currently obtains ``paths`` from an unsorted glob. Their order
+    therefore remains part of the greedy tracking behavior.
+    """
     return [json.load(open(p)) for p in paths]
 
 
 def euclidean(p, q):
-    """Euclidean distance between two (y,x) points."""
+    """Return the Euclidean distance between two ``(y, x)`` points."""
     return math.hypot(p[0] - q[0], p[1] - q[1])
 
 
 def assign_labels_consistently(cells, prev_data, next_free_id, d_thresh=50):
-    """
-    Greedy one-to-one matcher.
-    Returns: list[str] (one label per current cell) and updated next_free_id.
+    """Assign labels by greedy nearest-centroid matching to the prior frame.
+
+    Cells are visited in their existing order. Each previous record can be
+    reused once, and only when its centroid is at most ``d_thresh`` away.
+    Unmatched cells receive monotonically increasing labels of the form
+    ``cellN``.
+
+    Returns:
+        A pair containing one label per cell and the next unused numeric ID.
     """
     used_prev = set()  # indices of prev_data already taken
     new_labels = []
@@ -55,23 +73,42 @@ def assign_labels_consistently(cells, prev_data, next_free_id, d_thresh=50):
 
     return new_labels, next_free_id
 
+
 def normalize_background(img, sigma, gpu):
-    
-    """
-    This function loads an image and performs the division of the input by a blurred filtered version of itself.
+    """Divide an image stack by its Gaussian-smoothed background.
+
+    Args:
+        img: Image data accepted by pyclesperanto, normally ``(time, y, x)``.
+        sigma: Gaussian scale applied in ``x`` and ``y``; no temporal blur is
+            applied because ``sigma_z`` is zero.
+        gpu: Whether to push ``img`` explicitly before calling pyclesperanto.
+
+    Returns:
+        The normalized stack as a NumPy array.
     """
     intensity_normalized = None
 
     if gpu:
         pushed = cle.push(img)
-        intensity_normalized = cle.divide_by_gaussian_background(pushed, intensity_normalized,
-                                                                 sigma_x=sigma, sigma_y=sigma, sigma_z=0)
-        intensity_normalized = np.asarray(intensity_normalized) #img is pulled from GPU memory
-    
+        intensity_normalized = cle.divide_by_gaussian_background(
+            pushed,
+            intensity_normalized,
+            sigma_x=sigma,
+            sigma_y=sigma,
+            sigma_z=0,
+        )
+        # Converting to NumPy also pulls an explicitly pushed image from GPU memory.
+        intensity_normalized = np.asarray(intensity_normalized)
+
     else:
         pushed = img
-        intensity_normalized = cle.divide_by_gaussian_background(pushed, intensity_normalized,
-                                                                 sigma_x=sigma, sigma_y=sigma, sigma_z=0)
+        intensity_normalized = cle.divide_by_gaussian_background(
+            pushed,
+            intensity_normalized,
+            sigma_x=sigma,
+            sigma_y=sigma,
+            sigma_z=0,
+        )
         intensity_normalized = np.asarray(intensity_normalized)
 
     return intensity_normalized
@@ -79,16 +116,18 @@ def normalize_background(img, sigma, gpu):
 
 @jit(nopython=True)
 def pad_with_reflect(data, pad_x, pad_y):
-    """
-    Reflective padding for a 3D array (t, x, y) along the spatial dimensions (x, y).
+    """Pad a ``(time, row, column)`` array by mirroring edge values.
 
-    Parameters:
-        data (np.ndarray): Input array of shape (t, x, y).
-        pad_x (int): Padding size along the x dimension.
-        pad_y (int): Padding size along the y dimension.
+    This older helper duplicates boundary pixels. Its convention differs from
+    :func:`reflect_pad_2d`, which is used by the active histogram filter.
+
+    Args:
+        data: Three-dimensional array ordered as ``(time, row, column)``.
+        pad_x: Padding on the row axis.
+        pad_y: Padding on the column axis.
 
     Returns:
-        np.ndarray: Padded array.
+        A padded array with the same dtype as ``data``.
     """
     t, x, y = data.shape
     padded = np.zeros((t, x + 2 * pad_x, y + 2 * pad_y), dtype=data.dtype)
@@ -124,15 +163,17 @@ def pad_with_reflect(data, pad_x, pad_y):
 
 @jit(nopython=True, parallel=True)
 def median_filter_1d_2d(img, filter_size):
-    """
-    Apply a median filter with filter size (1, H, W) to a 3D array using Numba.
+    """Subtract an exact spatial median background from each time frame.
 
-    Parameters:
-        img (np.ndarray): Input 3D array (shape: t, x, y).
-        filter_size (tuple): Tuple of filter size (1, height, width).
+    This is an older alternative to the active histogram-based approximation.
+    It converts its input to ``float32`` and does not filter across time.
+
+    Args:
+        img: Array ordered as ``(time, row, column)``.
+        filter_size: Window dimensions ``(1, height, width)``.
 
     Returns:
-        np.ndarray: Filtered 3D array.
+        The ``float32`` residual ``img - median_background``.
     """
     data = np.copy(img)
     data = np.asarray(data, dtype=np.float32)
@@ -160,14 +201,6 @@ def median_filter_1d_2d(img, filter_size):
     for t in prange(data.shape[0]):
         for x in range(data.shape[1]):
             for y in range(data.shape[2]):
-                # Extract the spatial window for the current position
-                # window = padded_data[
-                #          t,  # Keep the time slice fixed
-                #          x:x + f_x,
-                #          y:y + f_y
-                #          ]
-                # # Compute the median and assign it to the output
-                # filtered_data[t, x, y] = np.median(window)
                 window = padded_data[t, x:x + f_x, y:y + f_y].flatten()
                 # Partial sort to find the median
                 median = np.partition(window, k)[k]
@@ -175,15 +208,15 @@ def median_filter_1d_2d(img, filter_size):
 
     result_32bit = data - filtered_data
 
-    # Step 3: Convert to 16-bit
     return result_32bit
 
 
 @jit(nopython=True)
 def random_sample_without_replacement(arr, sample_size):
-    """
-    Randomly select `sample_size` values from `arr` without replacement.
-    Works by shuffling indices and taking the first `sample_size`.
+    """Select values using a partial Fisher-Yates shuffle of array indices.
+
+    This stochastic helper is retained from background-subtraction
+    benchmarking and is not called by the active segmentation pipeline.
     """
     n = len(arr)
     indices = np.arange(n)
@@ -193,10 +226,11 @@ def random_sample_without_replacement(arr, sample_size):
     return arr[indices[:sample_size]]
 
 
-# Reuse previous pad_with_reflect for 3D arrays (t, x, y) and modify to extract 2D padding
+# Histogram-median background subtraction used by the active pipeline
 
 @njit
 def bin_index(val, min_val, max_val, num_bins):
+    """Map a value to a histogram bin, clipping values outside the range."""
     if val <= min_val:
         return 0
     elif val >= max_val:
@@ -206,14 +240,17 @@ def bin_index(val, min_val, max_val, num_bins):
 
 @njit
 def bin_center(idx, min_val, max_val, num_bins):
+    """Return the intensity represented by the center of a histogram bin."""
     bin_width = (max_val - min_val) / num_bins
     return min_val + (idx + 0.5) * bin_width
 
 
 @njit
 def reflect_pad_2d(img, pad):
-    """
-    Reflect-padding for a 2D image (Numba-compatible).
+    """Pad a 2D image by reflecting values without duplicating its edge.
+
+    Returns an array with the same dtype as ``img``. This custom convention is
+    part of the fluorescence background correction and must remain stable.
     """
     h, w = img.shape
     padded = np.zeros((h + 2 * pad, w + 2 * pad), dtype=img.dtype)
@@ -236,8 +273,10 @@ def reflect_pad_2d(img, pad):
 
 @njit
 def find_median_from_hist(hist, total_count, min_val, max_val, num_bins):
-    """
-    Compute approximate median from histogram.
+    """Return the current histogram-based approximation of the median.
+
+    The cumulative cutoff and bin-center convention are intentionally
+    documented rather than replaced with a library median implementation.
     """
     cum_sum = 0
     threshold = total_count // 2
@@ -247,8 +286,21 @@ def find_median_from_hist(hist, total_count, min_val, max_val, num_bins):
             return bin_center(b, min_val, max_val, num_bins)
     return 0.0  # fallback
 
+
 @njit
-def sliding_window_histogram_median_2d_reused_pad(image, window_size, min_val, max_val, num_bins):
+def sliding_window_histogram_median_2d_reused_pad(
+    image,
+    window_size,
+    min_val,
+    max_val,
+    num_bins,
+):
+    """Approximate a 2D median background with a sliding histogram.
+
+    The active call uses an odd window. Values outside the configured
+    intensity range are accumulated in the first or last histogram bin, and
+    the result keeps the input dtype.
+    """
     H, W = image.shape
     pad = window_size // 2
     padded = reflect_pad_2d(image, pad)
@@ -285,6 +337,12 @@ def sliding_window_histogram_median_2d_reused_pad(image, window_size, min_val, m
 
 @njit(parallel=True)
 def histogram_median_filter_batch_time(data, window_size, min_val, max_val, num_bins):
+    """Subtract a per-frame histogram-median background from an image stack.
+
+    Frames in ``(time, row, column)`` order are processed independently. The
+    returned residual has the same shape and follows NumPy's input/output dtype
+    behavior for the subtraction.
+    """
     t, x, y = data.shape
     result = np.zeros_like(data)
 
@@ -293,30 +351,69 @@ def histogram_median_filter_batch_time(data, window_size, min_val, max_val, num_
             data[ti], window_size, min_val, max_val, num_bins
         )
 
-    return data - result  # return residual (original - background)
+    return data - result
 
-# _______________________________________________
+
+# Active segmentation, tracking, and measurement pipeline
 
 
 def apoc_seg(clf, img, outdir, npix=600, npix_max=3500, bin_factor=2):
-    """Segmentation using APOC library"""
+    """Preprocess, segment, track, and measure a microscopy position.
+
+    The input is expected in ``(time, channel, y, x)`` order with at least two
+    channels. Channel 0 is divided by a Gaussian background and used for APOC
+    classification. All channels are spatially mean-binned, after which
+    channel 1 receives histogram-median background subtraction. Channels 2 and
+    above are binned and measured without that subtraction.
+
+    Cell regions are filtered with the exclusive bounds
+    ``npix < area < npix_max``. Areas, centroids, coordinates, contours, and
+    the 50-pixel tracking distance all refer to the binned image grid. Tracking
+    is greedy, uses only the preceding frame's JSON files, and does not bridge
+    missing frames.
+
+    One JSON file is written per retained cell and frame. It contains summed
+    and per-pixel values for every processed channel. Coordinates and centers
+    use ``(row, column)`` order; contour coordinates are saved separately as
+    ``xcoords`` and ``ycoords``. NaN values are allowed to propagate into the
+    measurements and JSON output.
+
+    Args:
+        clf: Initialized APOC classifier exposing ``predict(image)``.
+        img: Image array expected in ``(time, channel, y, x)`` order.
+        outdir: Existing directory for per-cell JSON output.
+        npix: Exclusive lower cell-area bound on the binned grid.
+        npix_max: Exclusive upper cell-area bound on the binned grid.
+        bin_factor: Mean-binning factor for both spatial dimensions.
+
+    Returns:
+        None. Results are written to ``outdir``.
+    """
     downsampled = np.copy(img)
     image = downsampled[:, 0, :, :]
-    # FCC by division of a gaussian-blurred image
+
+    # Normalize bright-field channel 0 before spatial binning.
     normalize = normalize_background(image, sigma, gpu)
     downsampled[:, 0, :, :] = normalize
-    downsampled = block_reduce(downsampled, block_size=(1, 1, bin_factor, bin_factor), func=np.mean)
+    downsampled = block_reduce(
+        downsampled,
+        block_size=(1, 1, bin_factor, bin_factor),
+        func=np.mean,
+    )
     normalize = downsampled[:, 0, :, :]
-    # Background subtraction of fluorescence by removing median-filtered image
 
-    sub_c1 = histogram_median_filter_batch_time(downsampled[:, 1,:, :], window_size=141,
-                                                min_val=0.0, max_val=16383.0, num_bins=8192)
+    # Subtract the approximate spatial background from fluorescence channel 1.
+    sub_c1 = histogram_median_filter_batch_time(
+        downsampled[:, 1, :, :],
+        window_size=141,
+        min_val=0.0,
+        max_val=16383.0,
+        num_bins=8192,
+    )
     downsampled[:, 1, :, :] = sub_c1
 
+    # Classify each frame independently using normalized bright-field data.
     normalize = cle.push(normalize)
-    # struct_element = disk(2)
-    # struct_element = struct_element[np.newaxis, :, :]
-    # struct_element = cle.asarray(struct_element)
     prediction = cle.create_like(normalize)
     for t in range(prediction.shape[0]):
         prediction[t] = clf.predict(normalize[t]) - 1
@@ -326,63 +423,51 @@ def apoc_seg(clf, img, outdir, npix=600, npix_max=3500, bin_factor=2):
             prediction, radius_x=2, radius_y=2, radius_z=0, connectivity='sphere'),
         radius_x=2, radius_y=2, radius_z=0, connectivity='sphere'
     )
+
+    # Connected components are intentionally computed on the complete stack.
+    # CLE's 3D box-connectivity behavior therefore governs temporal adjacency.
     label_im = np.asarray(cle.connected_components_labeling(filled, connectivity='box'))
 
-    # Tracking
+    # Labels start again for each position and increase across its frames.
+    next_cell_id = 0
 
-    # ------------- initialise the global counter once -----------------
-    next_cell_id = 0  # will keep growing across all frames
-    # ------------------------------------------------------------------
-
-    for t in range(normalize.shape[0]):  # loop over time
+    for t in range(normalize.shape[0]):
         if len(normalize[t]) == 0:
             raise ValueError("normalize[t] is empty. Check your input data.")
-        # ------------------------------------------------------------------
-        # SEGMENTATION (your code: prediction → label_im) -------------------
-        # ------------------------------------------------------------------
-        # prediction = ...
-        # label_im   = label(filled[t])
         regions = regionprops(label_im[t])
 
-        # keep only reasonable-size regions
+        # Area thresholds are strict and apply after spatial binning.
         cells = [r for r in regions if npix < r.area < npix_max]
-        # print(f"Frame {t}: {len(cells)} segmented regions")
 
-        # ------------------------------------------------------------------
-        # load previous-frame JSONs and assign consistent labels ------------
-        # ------------------------------------------------------------------
-        prev_paths = [] if t == 0 else glob.glob(os.path.join(
-            outdir, f"mask_tf{t - 1}_apoc_cell*.json"))
+        # Existing previous-frame JSON files are the complete tracking state.
+        prev_paths = [] if t == 0 else glob.glob(
+            os.path.join(outdir, f"mask_tf{t - 1}_apoc_cell*.json")
+        )
         prev_data = read_previous_label_data(prev_paths)
 
         labels, next_cell_id = assign_labels_consistently(
-            cells, prev_data, next_cell_id, d_thresh=50)
+            cells,
+            prev_data,
+            next_cell_id,
+            d_thresh=50,
+        )
 
-        # ------------------------------------------------------------------
-        # MEASURE intensities, build masks, write JSON ----------------------
-        # ------------------------------------------------------------------
         for cell, label_str in zip(cells, labels):
-            # intensity over channels
+            # Measure every processed channel through the bright-field mask.
             intensities, intensities_list = [], []
             for ch_img in downsampled[t]:
                 pix = ch_img[cell.coords[:, 0], cell.coords[:, 1]]
                 intensities.append(float(pix.sum()))
                 intensities_list.append(pix.tolist())
 
-            # pixel mask for contour
             from skimage.measure import find_contours
 
-            # Create binary mask from cell coords
+            # Extract the longest boundary in (row, column) coordinates.
             mask = np.zeros(normalize[0].shape, dtype=bool)
             mask[cell.coords[:, 0], cell.coords[:, 1]] = True
-
-            # Extract contours at the 0.5 level
             contours = find_contours(mask, level=0.5)
-
-            # contours is a list of (N, 2) arrays. Use the longest contour (if multiple)
             contour = max(contours, key=len) if contours else np.array([])
 
-            # Data to save
             rec = {
                 "npixels": int(cell.area),
                 "center": [float(cell.centroid[0]), float(cell.centroid[1])],
@@ -397,156 +482,3 @@ def apoc_seg(clf, img, outdir, npix=600, npix_max=3500, bin_factor=2):
             fname = os.path.join(outdir, f"mask_tf{t}_apoc_{label_str}.json")
             with open(fname, "w") as fh:
                 json.dump(rec, fh)
-        #     outname = os.path.join(outdir, 'mask_tf{}_apoc_{}'.format(count, celllabel))
-        #     try:
-        #         imsave(outname+'.tif',mask0)
-        #     except IndexError:
-        #         pass
-        # union_mask = np.logical_or.reduce(masks)
-        # background_mask = np.logical_not(union_mask)
-        # outname = os.path.join(outdir, 'mask_tf{}_background.tif'.format(count))
-        # try:
-        #     imsave(outname, background_mask)
-        # except IndexError:
-        #     pass
-
-#_______________________________________________
-# class NpEncoder(json.JSONEncoder):
-#     def default(self, obj):
-#         if isinstance(obj, np.integer):
-#             return int(obj)
-#         if isinstance(obj, np.floating):
-#             return float(obj)
-#         if isinstance(obj, np.ndarray):
-#             return obj.tolist()
-#         return super(NpEncoder, self).default(obj)
-#
-
-#_______________________________________________
-# @nb.njit(fastmath = True)
-# def fastiter(image, thr=2., delta=1):
-#     img_seeds=np.zeros(image.shape, dtype=bool_)
-#     for i in range(image.shape[0]):
-#         bkg=[]
-#         for ii in range(-5,5):
-#             iii=ii+i
-#             if iii<0 or iii>image.shape[0]-1:continue
-#             for jj in range(0,25):
-#                 bkg.append(image[iii][jj])
-#         bkg=np.array(bkg)
-#         std=np.std(bkg)
-#         for j in range(image.shape[1]):
-#             sig=[]
-#             for id in range(-delta, delta+1):
-#                 if id+i<0 or id+i>image.shape[0]-1:continue
-#                 for jd in range(-delta, delta+1):
-#                     if jd+j<0 or jd+j>image.shape[1]-1:continue
-#                     sig.append(image[i+id][j+jd])
-#
-#             if np.std(np.array(sig))>thr*std:
-#                 img_seeds[i][j]=True
-#     return img_seeds
-
-
-
-
-
-#_______________________________________________
-# def simpleSeg(img,  outdir, count, thr=2., delta=1, npix=400, npix_max = 5000):
-#     image=img[0]
-#     img_seeds=fastiter(image, thr, delta)
-#
-#     #dilated = binary_dilation(img_seeds, disk(2))
-#     closed = binary_closing(img_seeds, disk(4))
-#     filled = binary_fill_holes(closed).astype(int)
-#     label_im = label(filled)
-#
-#     regions=regionprops(label_im)
-#     cells=[]
-#     for r in regions:
-#         if r.area>npix and r.area<npix_max:
-#             cells.append(r)
-#
-#     previous_labels=[]
-#     if count>0:
-#         previous_labels = glob.glob(os.path.join(outdir, 'mask_tf{}_thr{}delta{}_cell*.json'.format(count-1,thr,delta)))
-#     extracount=0
-#     for c in range(len(cells)):
-#         minDist=1000000000
-#         celllabel='cell{}'.format(c)
-#         for pl in previous_labels:
-#             pl_file = open(pl)
-#             pl_data = json.load(pl_file)
-#
-#             dist=math.sqrt((pl_data['center'][0]-cells[c].centroid[0])*(pl_data['center'][0]-cells[c].centroid[0])+
-#                     (pl_data['center'][1]-cells[c].centroid[1])*(pl_data['center'][1]-cells[c].centroid[1]))
-#             if dist<minDist:
-#                 minDist=dist
-#                 celllabel=pl_data['label']
-#
-#         if minDist>50 and minDist<100000000:
-#             celllabel='cell{}'.format(len(previous_labels)+extracount)
-#             extracount+=1
-#         intensities=[]
-#         intensities_list=[]
-#
-#         for i in range(len(img)):
-#             intensity=0
-#             intensity_list=[]
-#             for coord in cells[c].coords:
-#                 intensity+=img[i][coord[0]][coord[1]]
-#                 intensity_list.append(img[i][coord[0]][coord[1]])
-#             intensities.append(intensity)
-#             intensities_list.append(intensity_list)
-#
-#         mask0=np.zeros(img[0].shape, dtype=bool)
-#         for coord in cells[c].coords:
-#             mask0[coord[0]][coord[1]]=True
-#         cs=plt.contour(mask0, [0.5],linewidths=1.2,  colors='red')
-#         contcoords= cs.allsegs[0][0]
-#
-#
-#         dic={
-#             'npixels':cells[c].area,
-#             'center':cells[c].centroid,
-#             'nchannels':len(img),
-#             'intensity':intensities,
-#             'label':celllabel,
-#             'coords':cells[c].coords,
-#             'xcoords':contcoords[:,0],
-#             'ycoords':contcoords[:,1],
-#             'intensity_list':intensities_list
-#         }
-#         json_object = json.dumps(dic, cls=NpEncoder)
-#
-#         # Writing to <out>.json
-#         outname=os.path.join(outdir, 'mask_tf{}_thr{}delta{}_{}.json'.format(count,thr,delta,celllabel))
-#         with open(outname, "w") as outfile:
-#             outfile.write(json_object)
-#
-#
-#     #Take simple seg as default
-#     celldic={}
-#     celllist=glob.glob(os.path.join(outdir , 'mask_tf{}_thr{}delta{}_cell*.json'.format(count,2.,2)))
-#     celllist.sort()
-#     for cellid, cell in enumerate(celllist):
-#
-#         celldic[os.path.split(cell)[-1].split('_')[-1].replace('.json','')]={
-# 			'mask':cell,
-#         	'valid':True, #Set to False if user find out this cell is bad
-# 		    'alive':True, #True/False
-# 			'status':'single',  #'single, doublenuclei, multiplecells, pair from a menu'
-#         	'isdividing':False, #True/False', can span over multiple TF
-#             }
-#
-#
-#     timeframedic={
-#         'skipframe':False, #false by default
-#         'cells':celldic
-#             }
-#     jsontf_object = json.dumps(timeframedic, indent=4)
-#     outnametf=os.path.join(outdir, 'metadata_tf{}.json'.format(count))
-#     if not os.path.isfile(outnametf):
-#
-#         with open(outnametf, "w") as outfiletf:
-#             outfiletf.write(jsontf_object)
